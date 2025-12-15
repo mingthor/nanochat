@@ -60,6 +60,7 @@ core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
+profile_step = -1 # which step to profile (-1 = disable)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -301,6 +302,25 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
+
+    # start the profiler (only on master process to avoid race conditions)
+    do_profile = (step == profile_step and master_process)
+    if do_profile:
+        profiler_dir = os.path.join(base_dir, "profiler")
+        if not os.path.exists(profiler_dir):
+            os.makedirs(profiler_dir, exist_ok=True)
+        print0(f"Starting profiler for step {step}...")
+        trace_path = os.path.join(profiler_dir, f"trace_step_{step}.json")
+        prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=None,
+            on_trace_ready=lambda p: p.export_chrome_trace(trace_path),
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=True
+        )
+        prof.start()
+
     # evaluate the gradient
     synchronize()
     t0 = time.time()
@@ -330,6 +350,12 @@ while True:
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+
+    # stop the profiler
+    if do_profile:
+        prof.stop()
+        print0(f"Profiler stopped. Trace saved to {trace_path}")
+
     # -------------------------------------------------------------------------
 
     # logging
