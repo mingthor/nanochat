@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # This script is the "Best ChatGPT clone that $100 can buy",
 # It is designed to run in ~4 hours on 8XH100 node at $3/GPU/hour.
@@ -16,16 +17,47 @@ export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
-# Python venv setup with uv
+# Python environment setup
 
-# install uv (if not already installed)
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-# create a .venv local virtual environment (if it doesn't exist)
-[ -d ".venv" ] || uv venv
-# install the repo dependencies
-uv sync --extra gpu
-# activate venv so that `python` uses the project's venv instead of system python
-source .venv/bin/activate
+if [ -n "$CONDA_ENV" ]; then
+    # Using existing conda environment
+    echo "Using Conda environment: $CONDA_ENV"
+
+    # Initialize conda if needed
+    eval "$(conda shell.bash hook)" 2>/dev/null || true
+
+    # activate conda environment
+    conda activate "$CONDA_ENV"
+
+    # Unset VIRTUAL_ENV to avoid conflicts with conda
+    unset VIRTUAL_ENV
+
+    # install only the non-pytorch dependencies
+    python -m pip install datasets fastapi files-to-prompt psutil regex setuptools tiktoken tokenizers uvicorn wandb maturin
+    
+    # Ensure the bin directory of the current python is in PATH so we can find maturin and files-to-prompt
+    PYTHON_BIN_DIR="$(python -c 'import sys, os; print(os.path.join(sys.prefix, "bin"))')"
+    # Also add user base bin directory (common for --user installs or some distros)
+    USER_BIN_DIR="$(python -c 'import site, os; print(os.path.join(site.getuserbase(), "bin"))')"
+    export PATH="$PYTHON_BIN_DIR:$USER_BIN_DIR:$PATH"
+
+    MATURIN_CMD="maturin"
+else
+    # Using uv (default)
+    echo "Using uv for environment management"
+
+    # install uv (if not already installed)
+    command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+    # create a .venv local virtual environment (if it doesn't exist)
+    [ -d ".venv" ] || uv venv
+
+    # Sync dependencies (creates .venv if needed)
+    uv sync --extra gpu
+
+    # Activate the environment
+    source .venv/bin/activate
+    MATURIN_CMD="uv run maturin"
+fi
 
 # -----------------------------------------------------------------------------
 # wandb setup
@@ -48,12 +80,18 @@ python -m nanochat.report reset
 # -----------------------------------------------------------------------------
 # Tokenizer
 
-# Install Rust / Cargo
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
+# Install Rust / Cargo (skip if already installed)
+if ! command -v cargo &> /dev/null; then
+    echo "Installing Rust toolchain..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    source "$HOME/.cargo/env"
+else
+    echo "Rust toolchain already installed"
+    source "$HOME/.cargo/env"
+fi
 
 # Build the rustbpe Tokenizer
-uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
+$MATURIN_CMD develop --release --manifest-path rustbpe/Cargo.toml
 
 # Download the first ~2B characters of pretraining dataset
 # look at dev/repackage_data_reference.py for details on how this data was prepared
@@ -86,11 +124,11 @@ wait $DATASET_DOWNLOAD_PID
 NPROC_PER_NODE=8
 
 # pretrain the d20 model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
 # evaluate the model on a larger chunk of train/val data and draw some samples
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
+python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
 # evaluate the model on CORE tasks
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
 
 # -----------------------------------------------------------------------------
 # Midtraining (teach the model conversation special tokens, tool use, multiple choice)
@@ -100,15 +138,15 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run midtraining and eval the model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
+python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
+python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
 
 # -----------------------------------------------------------------------------
 # Supervised Finetuning (domain adaptation to each sequence all by itself per row)
 
 # train sft and re-eval right away (should see a small bump)
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
+python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
+python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
