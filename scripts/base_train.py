@@ -5,7 +5,7 @@ python base_train.py
 
 or distributed as:
 
-torchrun --nproc_per_node=8 base_train.py
+torchrun --nproc_per_node=8 -m scripts.base_train
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
 python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
@@ -324,13 +324,20 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    # Prefetch the first batch before the loop
+    next_x, next_y, next_dataloader_state_dict = next(train_loader)
+
     for micro_step in range(grad_accum_steps):
+        x, y, dataloader_state_dict = next_x, next_y, next_dataloader_state_dict
+    
         with autocast_ctx:
             loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # Prefetch NEXT batch while GPU is busy
+        next_x, next_y, next_dataloader_state_dict = next(train_loader)
+
     # gradient clipping
     grad_clip_enabled = grad_clip > 0.0
     if grad_clip_enabled:
