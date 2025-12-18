@@ -21,6 +21,7 @@ import tempfile
 from contextlib import nullcontext
 
 import torch
+import torch.distributed as dist
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer
@@ -84,12 +85,13 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
             'num_fewshot': task['num_fewshot'][0],
             'continuation_delimiter': task.get('continuation_delimiter', ' ')
         }
-        print0(f"Evaluating: {label} ({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})... ", end='')
 
         # Load data for this task
         data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
         with open(data_path, 'r', encoding='utf-8') as f:
             data = [json.loads(line.strip()) for line in f]
+
+        print0(f"Evaluating {label} {len(data)} examples: ({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})... ", end='')
 
         # shuffle the data because in many cases it appears ordered but we want
         # the ability to only run a subset of the data for debugging purposes etc.
@@ -106,7 +108,8 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
         end_time = time.time()
-        print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {end_time - start_time:.2f}s")
+        examples_per_sec = len(data) / (end_time - start_time)
+        print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {end_time - start_time:.2f}s | ex/s: {examples_per_sec:.1f}")
 
     core_metric = sum(centered_results.values()) / len(centered_results)
     out = {
