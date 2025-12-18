@@ -238,10 +238,10 @@ def evaluate_batch(indices, model, tokenizer, data, device, task_meta):
     losses, predictions = forward_model(model, input_ids)
     
     # 5. Calculate results
-    batch_results = []
+    batch_results = torch.zeros(len(item_metadata), device=device)
     result_cursor = 0
     
-    for meta in item_metadata:
+    for i, meta in enumerate(item_metadata):
         num_seq = meta['num_sequences']
         item_losses = losses[result_cursor : result_cursor + num_seq]
         item_predictions = predictions[result_cursor : result_cursor + num_seq]
@@ -258,14 +258,14 @@ def evaluate_batch(indices, model, tokenizer, data, device, task_meta):
             ei = item_end_idxs[0]
             predicted_tokens = item_predictions[0, si-1:ei-1]
             actual_tokens = item_input_ids[0, si:ei]
-            is_correct = torch.all(predicted_tokens == actual_tokens).item()
+            is_correct = torch.all(predicted_tokens == actual_tokens)
         elif task_type in ['multiple_choice', 'schema']:
-            mean_losses = [item_losses[i, si-1:ei-1].mean().item()
-                            for i, (si, ei) in enumerate(zip(item_start_idxs, item_end_idxs))]
-            pred_idx = mean_losses.index(min(mean_losses))
-            is_correct = pred_idx == meta['item']['gold']
+            item_mean_losses = torch.stack([item_losses[j, si-1:ei-1].mean()
+                            for j, (si, ei) in enumerate(zip(item_start_idxs, item_end_idxs))])
+            pred_idx = torch.argmin(item_mean_losses)
+            is_correct = (pred_idx == meta['item']['gold'])
             
-        batch_results.append(is_correct)
+        batch_results[i] = is_correct.float()
     
     return batch_results
 
@@ -291,8 +291,7 @@ def evaluate_task(model, tokenizer, data, device, task_meta, batch_size=8):
         batch_indices = local_indices[batch_start:batch_start + batch_size]
         batch_results = evaluate_batch(batch_indices, model, tokenizer, data, device, task_meta)
         
-        for idx, is_correct in zip(batch_indices, batch_results):
-            correct[idx] = float(is_correct)
+        correct[batch_indices] = batch_results
         
         batch_num += len(batch_indices)
     
