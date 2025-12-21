@@ -13,52 +13,38 @@ from jinja2 import Template
 import torch
 import torch.distributed as dist
 
+from nanochat.configurator import print0
+
 # -----------------------------------------------------------------------------
 # Prompt rendering utilities
-
-# Pre-compile templates to avoid recompilation overhead
-_TEMPLATE_MC = Template("""
-{%- for example in fewshot_examples -%}
-{{ example.query }}{{ continuation_delimiter }}{{ example.choices[example.gold] }}
-
-{% endfor -%}
-{{ item.query }}{{ continuation_delimiter }}{{ choice }}""".strip())
-
-_TEMPLATE_SCHEMA = Template("""
-{%- for example in fewshot_examples -%}
-{{ example.context_options[example.gold] }}{{ continuation_delimiter }}{{ example.continuation }}
-
-{% endfor -%}
-{{ context }}{{ continuation_delimiter }}{{ item.continuation }}""".strip())
-
-_TEMPLATE_LM = Template("""
-{%- for example in fewshot_examples -%}
-{{ example.context | trim }}{{ continuation_delimiter }}{{ example.continuation }}
-
-{% endfor -%}
-{{ item.context | trim }}{{ continuation_delimiter }}{% if include_continuation %}{{ item.continuation }}{% endif %}""".strip())
 
 def render_prompts_mc(item, continuation_delimiter, fewshot_examples=None):
     """Render complete prompts for a multiple choice question"""
     fewshot_examples = fewshot_examples or []
-    context = {
-        'fewshot_examples': fewshot_examples,
-        'continuation_delimiter': continuation_delimiter,
-        'item': item
-    }
-    prompts = [_TEMPLATE_MC.render(choice=choice, **context) for choice in item['choices']]
+    parts = []
+    for ex in fewshot_examples:
+        parts.append(f"{ex['query']}{continuation_delimiter}{ex['choices'][ex['gold']]}")
+    prefix = "\n\n".join(parts)
+    if prefix:
+        prefix += "\n\n"
+    
+    query = item['query']
+    prompts = [f"{prefix}{query}{continuation_delimiter}{choice}" for choice in item['choices']]
     return prompts
 
 
 def render_prompts_schema(item, continuation_delimiter, fewshot_examples=None):
     """Render complete prompts for a schema question"""
     fewshot_examples = fewshot_examples or []
-    context = {
-        'fewshot_examples': fewshot_examples,
-        'continuation_delimiter': continuation_delimiter,
-        'item': item
-    }
-    prompts = [_TEMPLATE_SCHEMA.render(context=context_option, **context)
+    parts = []
+    for ex in fewshot_examples:
+        parts.append(f"{ex['context_options'][ex['gold']]}{continuation_delimiter}{ex['continuation']}")
+    prefix = "\n\n".join(parts)
+    if prefix:
+        prefix += "\n\n"
+    
+    continuation = item['continuation']
+    prompts = [f"{prefix}{context_option}{continuation_delimiter}{continuation}"
                for context_option in item['context_options']]
     return prompts
 
@@ -66,24 +52,19 @@ def render_prompts_schema(item, continuation_delimiter, fewshot_examples=None):
 def render_prompts_lm(item, continuation_delimiter, fewshot_examples=None):
     """
     Render complete prompt for a language modeling task.
-    Notice that we manually trim the context in the template,
-    which in some datasets seems to have trailing whitespace (which we don't want).
     """
     fewshot_examples = fewshot_examples or []
-    context = {
-        'fewshot_examples': fewshot_examples,
-        'continuation_delimiter': continuation_delimiter,
-        'item': item
-    }
-    # Return two prompts: without and with the continuation
-    prompt_without = _TEMPLATE_LM.render(include_continuation=False, **context)
-    prompt_with = _TEMPLATE_LM.render(include_continuation=True, **context)
-    # Due to the way the data seems to be stored, I think I need to strip in the case of LM here.
-    # Otherwise we may get trailing whitespaces in prompt_without (which get absorbed into the next
-    # token in prompt_with), meaning we don't get a nice and clean prefix in the token space
-    # to detect the final continuation. Tokenizers...
-    prompt_without = prompt_without.strip()
-    return [prompt_without, prompt_with]
+    parts = []
+    for ex in fewshot_examples:
+        parts.append(f"{ex['context'].strip()}{continuation_delimiter}{ex['continuation']}")
+    prefix = "\n\n".join(parts)
+    if prefix:
+        prefix += "\n\n"
+    
+    context_str = item['context'].strip()
+    prompt_without_raw = f"{prefix}{context_str}{continuation_delimiter}"
+    prompt_with = f"{prompt_without_raw}{item['continuation']}"
+    return [prompt_without_raw.strip(), prompt_with]
 
 
 def find_common_length(token_sequences, direction='left'):
@@ -91,32 +72,41 @@ def find_common_length(token_sequences, direction='left'):
     Find the length of the common prefix or suffix across token sequences
     - direction: 'left' for prefix, 'right' for suffix
     """
-    min_len = min(len(seq) for seq in token_sequences)
-    indices = {
-        'left': range(min_len),
-        'right': range(-1, -min_len-1, -1)
-    }[direction]
-    # Find the first position where the token sequences differ
-    for i, idx in enumerate(indices):
-        token = token_sequences[0][idx]
-        if not all(seq[idx] == token for seq in token_sequences):
-            return i
-    return min_len
+    if not token_sequences: return 0
+    n = len(token_sequences)
+    if n == 1: return len(token_sequences[0])
+    
+    min_len = min(len(s) for s in token_sequences)
+    if direction == 'left':
+        for i in range(min_len):
+            tok = token_sequences[0][i]
+            for j in range(1, n):
+                if token_sequences[j][i] != tok:
+                    return i
+        return min_len
+    else:
+        for i in range(1, min_len + 1):
+            tok = token_sequences[0][-i]
+            for j in range(1, n):
+                if token_sequences[j][-i] != tok:
+                    return i - 1
+        return min_len
 
 
 def stack_sequences(tokens, pad_token_id):
     """Stack up a list of token sequences, pad to longest on the right"""
-    bsz, seq_len = len(tokens), max(len(x) for x in tokens)
+    bsz = len(tokens)
+    seq_len = max(len(x) for x in tokens)
     input_ids = torch.full((bsz, seq_len), pad_token_id, dtype=torch.long)
     for i, x in enumerate(tokens):
-        input_ids[i, :len(x)] = torch.tensor(x, dtype=torch.long)
+        input_ids[i, :len(x)] = torch.as_tensor(x, dtype=torch.long)
     return input_ids
 
 
 
 
 @torch.no_grad()
-def forward_model(model, input_ids):
+def forward_model(model, input_ids, task_type):
     """
     Take BxT tensor of token ids, return BxT tensor of losses and argmax predictions.
     The last column of losses is set to nan because we don't have autoregressive targets there.
@@ -127,35 +117,48 @@ def forward_model(model, input_ids):
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
     # Calculate cross entropy at all positions
     losses = torch.nn.functional.cross_entropy(
-        outputs.view(batch_size * seq_len, -1),
-        target_ids.view(batch_size * seq_len),
+        outputs.view(-1, outputs.size(-1)),
+        target_ids.view(-1),
         reduction='none'
     ).view(batch_size, seq_len)
     # Set the last column to be nan because there is no autoregressive loss there
     losses[:, -1] = float('nan')
-    # Get the argmax predictions at each position
-    predictions = outputs.argmax(dim=-1)
+    
+    # Get the argmax predictions only if needed (for language_modeling)
+    # Use max instead of argmax for better performance when we only need indices
+    predictions = None
+    if task_type == 'language_modeling':
+        predictions = outputs.argmax(dim=-1)
     return losses, predictions
 
 
 @torch.no_grad()
-def evaluate_batch(indices, model, tokenizer, data, device, task_meta):
+def evaluate_task(model, tokenizer, data, device, task_meta, max_tokens=131072):
     """
-    Evaluate a batch of examples efficiently.
-    Returns a list of boolean results corresponding to each index.
+    This function is responsible for evaluating one task across many examples.
+    It also handles dispatch to all processes if the script is run with torchrun.
+    Optimized to batch multiple examples together for faster inference.
+    Returns a tuple of (accuracy, total_tokens).
     """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    
+    if len(data) == 0:
+        return 0.0, 0, 0.0
+
+    # stride the examples to each rank
+    local_indices = list(range(rank, len(data), world_size))
+
     task_type = task_meta['task_type']
     num_fewshot = task_meta['num_fewshot']
     continuation_delimiter = task_meta['continuation_delimiter']
-    
-    # 1. Render all prompts
+    all_indices_set = set(range(len(data)))
+
+    # 1. Render and tokenize ALL local prompts at once
     all_prompts = []
     item_metadata = [] # Stores (idx, item, num_prompts_raw)
     
-    data_len = len(data)
-    all_indices_set = set(range(data_len))
-
-    for idx in indices:
+    for idx in local_indices:
         item = data[idx]
         # Sample few-shot
         fewshot_examples = []
@@ -177,21 +180,15 @@ def evaluate_batch(indices, model, tokenizer, data, device, task_meta):
         all_prompts.extend(prompts)
         item_metadata.append({'idx': idx, 'item': item, 'num_prompts_raw': len(prompts)})
 
-    # 2. Tokenize all
     all_tokens = tokenizer(all_prompts, prepend=tokenizer.get_bos_token_id())
     
-    # 3. Process tokens (find indices, truncate, filter for LM)
-    flat_tokens = []
-    flat_start_idxs = []
-    flat_end_idxs = []
-    
+    # 2. Process all tokens (find indices, truncate, filter for LM)
     token_cursor = 0
     for meta in item_metadata:
         num_raw = meta['num_prompts_raw']
         raw_tokens = all_tokens[token_cursor : token_cursor + num_raw]
         token_cursor += num_raw
         
-        # Logic from batch_sequences_* and truncation
         if task_type == 'multiple_choice':
             answer_start_idx = find_common_length(raw_tokens, direction='left')
             start_idxs = [answer_start_idx] * len(raw_tokens)
@@ -211,12 +208,12 @@ def evaluate_batch(indices, model, tokenizer, data, device, task_meta):
             
         # Truncation
         if hasattr(model, 'max_seq_len') and model.max_seq_len is not None:
-            max_tokens = model.max_seq_len
+            model_max_seq_len = model.max_seq_len
             new_tokens, new_start_idxs, new_end_idxs = [], [], []
             for t, s, e in zip(tokens, start_idxs, end_idxs):
-                if len(t) > max_tokens:
-                    num_to_crop = len(t) - max_tokens
-                    new_tokens.append(t[-max_tokens:])
+                if len(t) > model_max_seq_len:
+                    num_to_crop = len(t) - model_max_seq_len
+                    new_tokens.append(t[-model_max_seq_len:])
                     new_start_idxs.append(s - num_to_crop)
                     new_end_idxs.append(e - num_to_crop)
                 else:
@@ -225,80 +222,107 @@ def evaluate_batch(indices, model, tokenizer, data, device, task_meta):
                     new_end_idxs.append(e)
             tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
             
-        flat_tokens.extend(tokens)
-        flat_start_idxs.extend(start_idxs)
-        flat_end_idxs.extend(end_idxs)
-        meta['num_sequences'] = len(tokens) # Store how many sequences this item resulted in
+        meta['tokens'] = tokens
+        meta['start_idxs'] = start_idxs
+        meta['end_idxs'] = end_idxs
+        meta['num_sequences'] = len(tokens)
 
-    # 4. Stack and Forward
+    # 3. Dynamic Batching and Forward
     pad_token_id = tokenizer.get_bos_token_id()
-    input_ids = stack_sequences(flat_tokens, pad_token_id)
-    input_ids = input_ids.to(device)
-    
-    losses, predictions = forward_model(model, input_ids)
-    
-    # 5. Calculate results
-    batch_results = torch.zeros(len(item_metadata), device=device)
-    result_cursor = 0
-    
-    for i, meta in enumerate(item_metadata):
-        num_seq = meta['num_sequences']
-        item_losses = losses[result_cursor : result_cursor + num_seq]
-        item_predictions = predictions[result_cursor : result_cursor + num_seq]
-        item_input_ids = input_ids[result_cursor : result_cursor + num_seq]
-        
-        # Need start/end idxs for this item
-        item_start_idxs = flat_start_idxs[result_cursor : result_cursor + num_seq]
-        item_end_idxs = flat_end_idxs[result_cursor : result_cursor + num_seq]
-        
-        result_cursor += num_seq
-        
-        if task_type == 'language_modeling':
-            si = item_start_idxs[0]
-            ei = item_end_idxs[0]
-            predicted_tokens = item_predictions[0, si-1:ei-1]
-            actual_tokens = item_input_ids[0, si:ei]
-            is_correct = torch.all(predicted_tokens == actual_tokens)
-        elif task_type in ['multiple_choice', 'schema']:
-            item_mean_losses = torch.stack([item_losses[j, si-1:ei-1].mean()
-                            for j, (si, ei) in enumerate(zip(item_start_idxs, item_end_idxs))])
-            pred_idx = torch.argmin(item_mean_losses)
-            is_correct = (pred_idx == meta['item']['gold'])
-            
-        batch_results[i] = is_correct.float()
-    
-    return batch_results
-
-
-
-
-def evaluate_task(model, tokenizer, data, device, task_meta, batch_size=8):
-    """
-    This function is responsible for evaluating one task across many examples.
-    It also handles dispatch to all processes if the script is run with torchrun.
-    Optimized to batch multiple examples together for faster inference.
-    """
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
-        
-    # stride the examples to each rank
-    local_indices = list(range(rank, len(data), world_size))
+    total_tokens = 0
+    inference_duration = 0
     
-    # Process examples in batches for efficiency
-    batch_num = 0
-    for batch_start in range(0, len(local_indices), batch_size):
-        batch_indices = local_indices[batch_start:batch_start + batch_size]
-        batch_results = evaluate_batch(batch_indices, model, tokenizer, data, device, task_meta)
+    # Sort items by their maximum sequence length to minimize padding
+    item_indices = sorted(range(len(item_metadata)), 
+                          key=lambda i: max(len(s) for s in item_metadata[i]['tokens']),
+                          reverse=True)
+    
+    current_items = []
+    current_sequences = []
+    current_max_len = 0
+    
+    def run_inference(items_to_process, sequences_to_process):
+        nonlocal total_tokens, inference_duration
+        if not sequences_to_process:
+            return
+        input_ids = stack_sequences(sequences_to_process, pad_token_id)
+        # Count only non-padding tokens for accurate MFU calculation
+        actual_tokens = sum(len(seq) for seq in sequences_to_process)
+        total_tokens += actual_tokens
+        input_ids = input_ids.to(device)
         
-        correct[batch_indices] = batch_results
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.time()
+        losses, predictions = forward_model(model, input_ids, task_type)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        inference_duration += time.time() - t0
         
-        batch_num += len(batch_indices)
+        seq_cursor = 0
+        for meta_idx in items_to_process:
+            meta = item_metadata[meta_idx]
+            num_seq = meta['num_sequences']
+            
+            item_losses = losses[seq_cursor : seq_cursor + num_seq]
+            item_input_ids = input_ids[seq_cursor : seq_cursor + num_seq]
+            item_start_idxs = meta['start_idxs']
+            item_end_idxs = meta['end_idxs']
+            
+            if task_type == 'language_modeling':
+                item_predictions = predictions[seq_cursor : seq_cursor + num_seq]
+                si, ei = item_start_idxs[0], item_end_idxs[0]
+                predicted_tokens = item_predictions[0, si-1:ei-1]
+                actual_tokens = item_input_ids[0, si:ei]
+                is_correct = torch.all(predicted_tokens == actual_tokens)
+            elif task_type in ['multiple_choice', 'schema']:
+                item_mean_losses = torch.stack([item_losses[j, si-1:ei-1].mean()
+                                for j, (si, ei) in enumerate(zip(item_start_idxs, item_end_idxs))])
+                pred_idx = torch.argmin(item_mean_losses)
+                is_correct = (pred_idx == meta['item']['gold'])
+            
+            correct[meta['idx']] = is_correct.float()
+            seq_cursor += num_seq
+
+    for i in item_indices:
+        meta = item_metadata[i]
+        item_sequences = meta['tokens']
+        num_seq = len(item_sequences)
+        item_max_len = max(len(s) for s in item_sequences)
+        
+        # Check if adding this item would exceed max_tokens
+        new_max_len = max(current_max_len, item_max_len)
+        new_num_seq = len(current_sequences) + num_seq
+        
+        if new_num_seq * new_max_len > max_tokens and current_sequences:
+            run_inference(current_items, current_sequences)
+            current_items = []
+            current_sequences = []
+            current_max_len = 0
+            # Recalculate for the new batch starting with this item
+            new_max_len = item_max_len
+            new_num_seq = num_seq
+            
+        current_items.append(i)
+        current_sequences.extend(item_sequences)
+        current_max_len = new_max_len
+        
+    run_inference(current_items, current_sequences)
     
     # sync results across all the processes if running distributed
     if world_size > 1:
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        # Total_tokens is already correctly counted per rank, so aggregate across ranks
+        total_tokens_tensor = torch.tensor([total_tokens], dtype=torch.long, device=device)
+        dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
+        total_tokens = total_tokens_tensor.item()
+        # For duration, we take the max across all ranks as they run in parallel
+        duration_tensor = torch.tensor([inference_duration], dtype=torch.float32, device=device)
+        dist.all_reduce(duration_tensor, op=dist.ReduceOp.MAX)
+        inference_duration = duration_tensor.item()
+        
     # compute the mean
     mean_correct = correct.mean().item()
-    return mean_correct
+    return mean_correct, total_tokens, inference_duration

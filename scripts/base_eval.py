@@ -73,9 +73,28 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
             random_baseline = row['Random baseline']
             random_baselines[task_name] = float(random_baseline)
 
+    # Estimate FLOPs per token for MFU calculation
+    num_flops_per_token = None
+    # Get the original model if it's compiled
+    raw_model = getattr(model, '_orig_mod', model)
+    if hasattr(raw_model, 'estimate_flops'):
+        num_flops_per_token = raw_model.estimate_flops() / 3 # forward only
+    elif hasattr(raw_model, 'model') and hasattr(raw_model.model, 'estimate_flops'):
+        num_flops_per_token = raw_model.model.estimate_flops() / 3
+    
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    promised_flops_per_sec_h100 = 989e12 * world_size
+
     # Evaluate each task
     results = {}
     centered_results = {}
+    total_eval_tokens = 0
+    total_eval_duration = 0
+    total_inference_duration = 0
+    
+    print0(f"{'Task':<30} | {'Acc':<8} | {'Cent':<8} | {'Time':<8} | {'Ex/s':<8} | {'Tok/s':<8} | {'MFU':<8}")
+    print0("-" * 95)
+    
     for task in tasks:
         start_time = time.time()
         label = task['label']
@@ -91,8 +110,6 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
         with open(data_path, 'r', encoding='utf-8') as f:
             data = [json.loads(line.strip()) for line in f]
 
-        print0(f"Evaluating {label} {len(data)} examples: ({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})... ", end='')
-
         # shuffle the data because in many cases it appears ordered but we want
         # the ability to only run a subset of the data for debugging purposes etc.
         shuffle_rng = random.Random(1337)
@@ -101,21 +118,50 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
             data = data[:max_per_task]
 
         # run the evaluation for this task
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy, total_tokens, inference_duration = evaluate_task(model, tokenizer, data, device, task_meta)
 
         results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
         end_time = time.time()
-        examples_per_sec = len(data) / (end_time - start_time)
-        print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {end_time - start_time:.2f}s | ex/s: {examples_per_sec:.1f}")
+        duration = end_time - start_time
+        examples_per_sec = len(data) / duration
+        tokens_per_sec = total_tokens / inference_duration if inference_duration > 0 else 0
+        
+        total_eval_tokens += total_tokens
+        total_eval_duration += duration
+        total_inference_duration += inference_duration
+        
+        mfu_str = "n/a"
+        if num_flops_per_token is not None and inference_duration > 0:
+            flops_per_sec = num_flops_per_token * total_tokens / inference_duration
+            mfu = 100 * flops_per_sec / promised_flops_per_sec_h100
+            mfu_str = f"{mfu:.2f}%"
+            
+        print0(f"{label:<30} | {accuracy:.4f} | {centered_result:.4f} | {duration:7.2f}s | {examples_per_sec:8.1f} | {tokens_per_sec:8.1f} | {mfu_str}")
 
     core_metric = sum(centered_results.values()) / len(centered_results)
+    
+    # Print summary
+    avg_tok_per_sec = total_eval_tokens / total_inference_duration if total_inference_duration > 0 else 0
+    avg_mfu = "n/a"
+    if num_flops_per_token is not None and total_inference_duration > 0:
+        avg_flops_per_sec = num_flops_per_token * total_eval_tokens / total_inference_duration
+        avg_mfu = f"{100 * avg_flops_per_sec / promised_flops_per_sec_h100:.2f}%"
+    
+    print0("-" * 95)
+    print0(f"{'TOTAL':<30} | {'':<8} | {core_metric:.4f} | {total_eval_duration:7.2f}s | {'':<8} | {avg_tok_per_sec:8.1f} | {avg_mfu}")
+    print0("-" * 95)
+
     out = {
         "results": results,
         "centered_results": centered_results,
-        "core_metric": core_metric
+        "core_metric": core_metric,
+        "total_tokens": total_eval_tokens,
+        "total_duration": total_eval_duration,
+        "avg_tok_per_sec": avg_tok_per_sec,
+        "avg_mfu": avg_mfu,
     }
     return out
 
@@ -173,6 +219,10 @@ def main():
         model_name = f"base_model (step {meta['step']})" # just for logging
         model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
 
+    # Compile the model for faster evaluation
+    print0("Compiling the model...")
+    model = torch.compile(model)
+
     # Evaluate the model
     with autocast_ctx:
         out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task)
@@ -205,6 +255,10 @@ def main():
         {
             "Model": model_name,
             "CORE metric": core_metric,
+            "Total tokens": out.get("total_tokens"),
+            "Total time": f"{out.get('total_duration'):.2f}s",
+            "Avg tok/s": f"{out.get('avg_tok_per_sec'):.1f}",
+            "Avg MFU": out.get("avg_mfu"),
         },
         centered_results, # the full table
     ])
