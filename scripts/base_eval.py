@@ -26,7 +26,7 @@ import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer
 from nanochat.checkpoint_manager import load_model
-from nanochat.core_eval import evaluate_task
+from nanochat.core_eval import evaluate_task, evaluate_tasks
 
 # -----------------------------------------------------------------------------
 # nanochat specific function dealing with I/O etc.
@@ -46,10 +46,11 @@ def place_eval_bundle(file_path):
         shutil.move(extracted_bundle_dir, eval_bundle_dir)
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
-def evaluate_model(model, tokenizer, device, max_per_task=-1):
+def evaluate_model(model, tokenizer, device, max_per_task=-1, max_tokens=131072):
     """
     Evaluate a base model on the CORE benchmark.
     - max_per_task: crop the data to this many examples per task for testing (-1 = disable)
+    - max_tokens: max tokens per batch for evaluation
     """
     # Load config and task metadata
     base_dir = get_base_dir()
@@ -89,14 +90,10 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
     results = {}
     centered_results = {}
     total_eval_tokens = 0
-    total_eval_duration = 0
     total_inference_duration = 0
     
-    print0(f"{'Task':<30} | {'Acc':<8} | {'Cent':<8} | {'Time':<8} | {'Ex/s':<8} | {'Tok/s':<8} | {'MFU':<8}")
-    print0("-" * 95)
-    
+    tasks_info = []
     for task in tasks:
-        start_time = time.time()
         label = task['label']
         task_meta = {
             'task_type': task['icl_task_type'],
@@ -116,30 +113,25 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
         shuffle_rng.shuffle(data)
         if max_per_task > 0:
             data = data[:max_per_task]
+        
+        tasks_info.append({'data': data, 'task_meta': task_meta, 'label': label})
 
-        # run the evaluation for this task
-        accuracy, total_tokens, inference_duration = evaluate_task(model, tokenizer, data, device, task_meta)
+    start_eval_time = time.time()
+    all_results = evaluate_tasks(model, tokenizer, tasks_info, device, max_tokens=max_tokens)
+    total_eval_duration = time.time() - start_eval_time
+
+    for task_info in tasks_info:
+        label = task_info['label']
+        data = task_info['data']
+        accuracy, total_tokens, inference_duration = all_results[label]
 
         results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
-        end_time = time.time()
-        duration = end_time - start_time
-        examples_per_sec = len(data) / duration
-        tokens_per_sec = total_tokens / inference_duration if inference_duration > 0 else 0
         
         total_eval_tokens += total_tokens
-        total_eval_duration += duration
         total_inference_duration += inference_duration
-        
-        mfu_str = "n/a"
-        if num_flops_per_token is not None and inference_duration > 0:
-            flops_per_sec = num_flops_per_token * total_tokens / inference_duration
-            mfu = 100 * flops_per_sec / promised_flops_per_sec_h100
-            mfu_str = f"{mfu:.2f}%"
-            
-        print0(f"{label:<30} | {accuracy:.4f} | {centered_result:.4f} | {duration:7.2f}s | {examples_per_sec:8.1f} | {tokens_per_sec:8.1f} | {mfu_str}")
 
     core_metric = sum(centered_results.values()) / len(centered_results)
     
@@ -150,10 +142,6 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
         avg_flops_per_sec = num_flops_per_token * total_eval_tokens / total_inference_duration
         avg_mfu = f"{100 * avg_flops_per_sec / promised_flops_per_sec_h100:.2f}%"
     
-    print0("-" * 95)
-    print0(f"{'TOTAL':<30} | {'':<8} | {core_metric:.4f} | {total_eval_duration:7.2f}s | {'':<8} | {avg_tok_per_sec:8.1f} | {avg_mfu}")
-    print0("-" * 95)
-
     out = {
         "results": results,
         "centered_results": centered_results,
@@ -198,6 +186,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path to evaluate')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
+    parser.add_argument('--max-tokens', type=int, default=131072, help='Max tokens per batch for evaluation')
     args = parser.parse_args()
 
     # distributed / precision setup
@@ -205,6 +194,7 @@ def main():
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 
+    start_time = time.time()
     # Load model and tokenizer from command line or from file system
     if args.hf_path is not None:
         # atm assume that if a path is given, it's a huggingface model path
@@ -220,12 +210,13 @@ def main():
         model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
 
     # Compile the model for faster evaluation
-    print0("Compiling the model...")
     model = torch.compile(model)
+    init_duration = time.time() - start_time
+    print0(f"Data loading and model compilation took {init_duration:.4f}s")
 
     # Evaluate the model
     with autocast_ctx:
-        out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task)
+        out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task, max_tokens=args.max_tokens)
 
     # Write out the results to a csv file
     core_metric = None
@@ -248,6 +239,9 @@ def main():
         print0("="*80)
         with open(output_csv_path, 'r', encoding='utf-8') as f:
             print0(f.read())
+        print0(f"Total time: {out['total_duration']:.2f}s")
+        print0(f"Average tokens/sec: {out['avg_tok_per_sec']:.1f}")
+        print0(f"Average MFU: {out['avg_mfu']}")
 
     # Log to report
     from nanochat.report import get_report

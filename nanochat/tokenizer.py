@@ -125,11 +125,34 @@ class HuggingFaceTokenizer:
         bos = self.encode_special("<|bos|>")
         return bos
 
-    def encode(self, text, *args, **kwargs):
+    def encode(self, text, prepend=None, append=None):
         if isinstance(text, str):
-            return self._encode_one(text, *args, **kwargs)
+            return self._encode_one(text, prepend=prepend, append=append)
         elif isinstance(text, list):
-            return [self._encode_one(t, *args, **kwargs) for t in text]
+            # Use encode_batch for faster processing
+            encodings = self.tokenizer.encode_batch(text, add_special_tokens=False)
+            all_ids = [e.ids for e in encodings]
+            
+            if prepend is not None or append is not None:
+                prepend_id = None
+                if prepend is not None:
+                    prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
+                
+                append_id = None
+                if append is not None:
+                    append_id = append if isinstance(append, int) else self.encode_special(append)
+                
+                new_all_ids = []
+                for ids in all_ids:
+                    new_ids = []
+                    if prepend_id is not None:
+                        new_ids.append(prepend_id)
+                    new_ids.extend(ids)
+                    if append_id is not None:
+                        new_ids.append(append_id)
+                    new_all_ids.append(new_ids)
+                return new_all_ids
+            return all_ids
         else:
             raise ValueError(f"Invalid input type: {type(text)}")
 

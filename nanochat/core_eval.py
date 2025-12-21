@@ -132,62 +132,63 @@ def forward_model(model, input_ids, task_type):
     return losses, predictions
 
 
-@torch.no_grad()
-def evaluate_task(model, tokenizer, data, device, task_meta, max_tokens=131072):
-    """
-    This function is responsible for evaluating one task across many examples.
-    It also handles dispatch to all processes if the script is run with torchrun.
-    Optimized to batch multiple examples together for faster inference.
-    Returns a tuple of (accuracy, total_tokens).
-    """
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    
-    if len(data) == 0:
-        return 0.0, 0, 0.0
+# -----------------------------------------------------------------------------
+# Evaluation helper functions
 
-    # stride the examples to each rank
-    local_indices = list(range(rank, len(data), world_size))
-
-    task_type = task_meta['task_type']
-    num_fewshot = task_meta['num_fewshot']
-    continuation_delimiter = task_meta['continuation_delimiter']
-    all_indices_set = set(range(len(data)))
-
-    # 1. Render and tokenize ALL local prompts at once
+def _prepare_item_metadata(tasks_info, rank, world_size):
+    """Render prompts and create metadata for all items across all tasks"""
+    all_item_metadata = []
     all_prompts = []
-    item_metadata = [] # Stores (idx, item, num_prompts_raw)
-    
-    for idx in local_indices:
-        item = data[idx]
-        # Sample few-shot
-        fewshot_examples = []
-        if num_fewshot > 0:
-            rng = random.Random(1234 + idx)
-            available_indices = list(all_indices_set - {idx})
-            fewshot_indices = rng.sample(available_indices, num_fewshot)
-            fewshot_examples = [data[i] for i in fewshot_indices]
+    for task_info in tasks_info:
+        data = task_info['data']
+        task_meta = task_info['task_meta']
+        label = task_info['label']
+        if len(data) == 0: continue
         
-        if task_type == 'multiple_choice':
-            prompts = render_prompts_mc(item, continuation_delimiter, fewshot_examples)
-        elif task_type == 'schema':
-            prompts = render_prompts_schema(item, continuation_delimiter, fewshot_examples)
-        elif task_type == 'language_modeling':
-            prompts = render_prompts_lm(item, continuation_delimiter, fewshot_examples)
-        else:
-            raise ValueError(f"Unsupported task type: {task_type}")
+        local_indices = list(range(rank, len(data), world_size))
+        task_type = task_meta['task_type']
+        num_fewshot = task_meta['num_fewshot']
+        continuation_delimiter = task_meta['continuation_delimiter']
+        all_indices_set = set(range(len(data)))
+        
+        for idx in local_indices:
+            item = data[idx]
+            fewshot_examples = []
+            if num_fewshot > 0:
+                rng = random.Random(1234 + idx)
+                available_indices = list(all_indices_set - {idx})
+                fewshot_indices = rng.sample(available_indices, num_fewshot)
+                fewshot_examples = [data[i] for i in fewshot_indices]
             
-        all_prompts.extend(prompts)
-        item_metadata.append({'idx': idx, 'item': item, 'num_prompts_raw': len(prompts)})
+            if task_type == 'multiple_choice':
+                prompts = render_prompts_mc(item, continuation_delimiter, fewshot_examples)
+            elif task_type == 'schema':
+                prompts = render_prompts_schema(item, continuation_delimiter, fewshot_examples)
+            elif task_type == 'language_modeling':
+                prompts = render_prompts_lm(item, continuation_delimiter, fewshot_examples)
+            else:
+                raise ValueError(f"Unsupported task type: {task_type}")
+            
+            all_prompts.extend(prompts)
+            meta = {
+                'task_label': label,
+                'task_type': task_type,
+                'idx': idx,
+                'item': item,
+                'num_prompts_raw': len(prompts)
+            }
+            all_item_metadata.append(meta)
+    return all_item_metadata, all_prompts
 
-    all_tokens = tokenizer(all_prompts, prepend=tokenizer.get_bos_token_id())
-    
-    # 2. Process all tokens (find indices, truncate, filter for LM)
+
+def _process_item_tokens(all_item_metadata, all_tokens, model_max_seq_len=None):
+    """Process tokenized prompts: find indices, handle truncation, and filter for LM"""
     token_cursor = 0
-    for meta in item_metadata:
+    for meta in all_item_metadata:
         num_raw = meta['num_prompts_raw']
         raw_tokens = all_tokens[token_cursor : token_cursor + num_raw]
         token_cursor += num_raw
+        task_type = meta['task_type']
         
         if task_type == 'multiple_choice':
             answer_start_idx = find_common_length(raw_tokens, direction='left')
@@ -206,9 +207,7 @@ def evaluate_task(model, tokenizer, data, device, task_meta, max_tokens=131072):
             start_idxs = [start_idx]
             end_idxs = [end_idx]
             
-        # Truncation
-        if hasattr(model, 'max_seq_len') and model.max_seq_len is not None:
-            model_max_seq_len = model.max_seq_len
+        if model_max_seq_len is not None:
             new_tokens, new_start_idxs, new_end_idxs = [], [], []
             for t, s, e in zip(tokens, start_idxs, end_idxs):
                 if len(t) > model_max_seq_len:
@@ -227,42 +226,27 @@ def evaluate_task(model, tokenizer, data, device, task_meta, max_tokens=131072):
         meta['end_idxs'] = end_idxs
         meta['num_sequences'] = len(tokens)
 
-    # 3. Dynamic Batching and Forward
-    pad_token_id = tokenizer.get_bos_token_id()
-    correct = torch.zeros(len(data), dtype=torch.float32, device=device)
-    total_tokens = 0
-    inference_duration = 0
-    
-    # Sort items by their maximum sequence length to minimize padding
-    item_indices = sorted(range(len(item_metadata)), 
-                          key=lambda i: max(len(s) for s in item_metadata[i]['tokens']),
-                          reverse=True)
-    
+
+def _run_inference_for_task_type(model, device, task_type, indices, all_item_metadata, pad_token_id, max_tokens, results_per_task):
+    """Run inference for all items of a specific task type using dynamic batching"""
     current_items = []
     current_sequences = []
     current_max_len = 0
     
-    def run_inference(items_to_process, sequences_to_process):
-        nonlocal total_tokens, inference_duration
-        if not sequences_to_process:
-            return
-        input_ids = stack_sequences(sequences_to_process, pad_token_id)
-        # Count only non-padding tokens for accurate MFU calculation
-        actual_tokens = sum(len(seq) for seq in sequences_to_process)
-        total_tokens += actual_tokens
-        input_ids = input_ids.to(device)
+    def run_inference_batch(items_to_process, sequences_to_process):
+        if not sequences_to_process: return
+        input_ids = stack_sequences(sequences_to_process, pad_token_id).to(device)
         
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
+        if device.type == 'cuda': torch.cuda.synchronize()
         t0 = time.time()
         losses, predictions = forward_model(model, input_ids, task_type)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        inference_duration += time.time() - t0
+        if device.type == 'cuda': torch.cuda.synchronize()
+        duration = time.time() - t0
         
         seq_cursor = 0
         for meta_idx in items_to_process:
-            meta = item_metadata[meta_idx]
+            meta = all_item_metadata[meta_idx]
+            label = meta['task_label']
             num_seq = meta['num_sequences']
             
             item_losses = losses[seq_cursor : seq_cursor + num_seq]
@@ -274,55 +258,117 @@ def evaluate_task(model, tokenizer, data, device, task_meta, max_tokens=131072):
                 item_predictions = predictions[seq_cursor : seq_cursor + num_seq]
                 si, ei = item_start_idxs[0], item_end_idxs[0]
                 predicted_tokens = item_predictions[0, si-1:ei-1]
-                actual_tokens = item_input_ids[0, si:ei]
-                is_correct = torch.all(predicted_tokens == actual_tokens)
+                actual_tokens_item = item_input_ids[0, si:ei]
+                is_correct = torch.all(predicted_tokens == actual_tokens_item)
             elif task_type in ['multiple_choice', 'schema']:
                 item_mean_losses = torch.stack([item_losses[j, si-1:ei-1].mean()
                                 for j, (si, ei) in enumerate(zip(item_start_idxs, item_end_idxs))])
                 pred_idx = torch.argmin(item_mean_losses)
                 is_correct = (pred_idx == meta['item']['gold'])
             
-            correct[meta['idx']] = is_correct.float()
+            results_per_task[label]['correct'].append((meta['idx'], is_correct.float()))
+            results_per_task[label]['total_tokens'] += sum(len(s) for s in meta['tokens'])
+            results_per_task[label]['inference_duration'] += duration * (num_seq / len(sequences_to_process))
             seq_cursor += num_seq
 
-    for i in item_indices:
-        meta = item_metadata[i]
+    for i in indices:
+        meta = all_item_metadata[i]
         item_sequences = meta['tokens']
         num_seq = len(item_sequences)
         item_max_len = max(len(s) for s in item_sequences)
         
-        # Check if adding this item would exceed max_tokens
         new_max_len = max(current_max_len, item_max_len)
         new_num_seq = len(current_sequences) + num_seq
         
         if new_num_seq * new_max_len > max_tokens and current_sequences:
-            run_inference(current_items, current_sequences)
-            current_items = []
-            current_sequences = []
-            current_max_len = 0
-            # Recalculate for the new batch starting with this item
-            new_max_len = item_max_len
-            new_num_seq = num_seq
+            run_inference_batch(current_items, current_sequences)
+            current_items, current_sequences, current_max_len = [], [], 0
+            new_max_len, new_num_seq = item_max_len, num_seq
             
         current_items.append(i)
         current_sequences.extend(item_sequences)
         current_max_len = new_max_len
-        
-    run_inference(current_items, current_sequences)
+    run_inference_batch(current_items, current_sequences)
+
+
+@torch.no_grad()
+def evaluate_task(model, tokenizer, data, device, task_meta, max_tokens=131072):
+    """
+    This function is responsible for evaluating one task across many examples.
+    It also handles dispatch to all processes if the script is run with torchrun.
+    Optimized to batch multiple examples together for faster inference.
+    Returns a tuple of (accuracy, total_tokens, inference_duration).
+    """
+    if len(data) == 0:
+        return 0.0, 0, 0.0
     
-    # sync results across all the processes if running distributed
-    if world_size > 1:
-        dist.barrier()
-        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
-        # Total_tokens is already correctly counted per rank, so aggregate across ranks
-        total_tokens_tensor = torch.tensor([total_tokens], dtype=torch.long, device=device)
-        dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
-        total_tokens = total_tokens_tensor.item()
-        # For duration, we take the max across all ranks as they run in parallel
-        duration_tensor = torch.tensor([inference_duration], dtype=torch.float32, device=device)
-        dist.all_reduce(duration_tensor, op=dist.ReduceOp.MAX)
-        inference_duration = duration_tensor.item()
+    tasks_info = [{'data': data, 'task_meta': task_meta, 'label': 'task'}]
+    results = evaluate_tasks(model, tokenizer, tasks_info, device, max_tokens)
+    return results['task']
+
+
+@torch.no_grad()
+def evaluate_tasks(model, tokenizer, tasks_info, device, max_tokens=131072):
+    """
+    Evaluate multiple tasks at once to maximize GPU utilization.
+    tasks_info: list of dicts with 'data', 'task_meta', 'label'
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    
+    # 1. Prepare all items across all tasks
+    all_item_metadata, all_prompts = _prepare_item_metadata(tasks_info, rank, world_size)
+
+    # 2. Tokenize all prompts at once
+    pad_token_id = tokenizer.get_bos_token_id()
+    all_tokens = tokenizer(all_prompts, prepend=pad_token_id) if all_prompts else []
+    
+    # 3. Process all tokens
+    model_max_seq_len = getattr(model, 'max_seq_len', None)
+    _process_item_tokens(all_item_metadata, all_tokens, model_max_seq_len)
+
+    # 4. Group by task_type for inference
+    all_task_types = sorted(list(set(info['task_meta']['task_type'] for info in tasks_info)))
+    task_type_to_indices = {tt: [] for tt in all_task_types}
+    for i, meta in enumerate(all_item_metadata):
+        task_type_to_indices[meta['task_type']].append(i)
         
-    # compute the mean
-    mean_correct = correct.mean().item()
-    return mean_correct, total_tokens, inference_duration
+    results_per_task = {info['label']: {'correct': [], 'total_tokens': 0, 'inference_duration': 0} for info in tasks_info}
+
+    for task_type in all_task_types:
+        indices = task_type_to_indices[task_type]
+        # Sort by length within task_type to minimize padding
+        indices = sorted(indices, key=lambda i: max(len(s) for s in all_item_metadata[i]['tokens']), reverse=True)
+        _run_inference_for_task_type(model, device, task_type, indices, all_item_metadata, pad_token_id, max_tokens, results_per_task)
+
+    # 5. Aggregate results per task
+    final_results = {}
+    for task_info in tasks_info:
+        label = task_info['label']
+        data_len = len(task_info['data'])
+        if data_len == 0:
+            final_results[label] = (0.0, 0, 0.0)
+            continue
+            
+        res = results_per_task[label]
+        correct_tensor = torch.zeros(data_len, device=device)
+        for idx, val in res['correct']:
+            correct_tensor[idx] = val
+            
+        total_tokens = res['total_tokens']
+        inference_duration = res['inference_duration']
+        
+        if world_size > 1:
+            dist.barrier()
+            dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+            tt_tensor = torch.tensor([total_tokens], dtype=torch.long, device=device)
+            dist.all_reduce(tt_tensor, op=dist.ReduceOp.SUM)
+            total_tokens = tt_tensor.item()
+            id_tensor = torch.tensor([inference_duration], dtype=torch.float32, device=device)
+            dist.all_reduce(id_tensor, op=dist.ReduceOp.MAX)
+            inference_duration = id_tensor.item()
+            
+        accuracy = correct_tensor.mean().item()
+        final_results[label] = (accuracy, total_tokens, inference_duration)
+        
+    return final_results
