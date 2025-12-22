@@ -275,8 +275,15 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    if step % 100 == 0 and device_type == "cuda":
+        mem_mib = torch.cuda.memory_allocated() / 1024**2
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        free_mib = free_mem / 1024**2
+        total_mib = total_mem / 1024**2
+        print0(f"mem: {mem_mib:.0f}MB | free: {free_mib:.0f}MB | total: {total_mib:.0f}MB")
+        torch.cuda.reset_peak_memory_stats()
     if step % 10 == 0:
-        wandb_run.log({
+        metrics = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -285,7 +292,8 @@ while True:
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
-        })
+        }
+        wandb_run.log(metrics)
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")

@@ -139,7 +139,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m
 
 # download 2.3MB of synthetic identity conversations to impart a personality to nanochat
 # see dev/gen_synthetic_data.py for details on how this data was prepared and to get a sense of how you can easily tune it
-curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://raw.githubusercontent.com/TrelisResearch/nanochat/master/identity_conversations.jsonl
 
 # run midtraining and eval the model
 python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN

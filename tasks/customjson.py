@@ -28,7 +28,7 @@ class CustomJSON(Task):
             print("If you recently did a git pull and suddely see this, it might be due to the new addition of identity conversations")
             print("See this discussion for more details: https://github.com/karpathy/nanochat/discussions/139")
             print("Quick fix: simply run the following command to download the file and you're done:")
-            print(f"curl -L -o {filepath} https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl")
+            print(f"curl -L -o {filepath} https://raw.githubusercontent.com/TrelisResearch/nanochat/master/identity_conversations.jsonl")
             print("-" * 80)
 
         else:
@@ -37,7 +37,18 @@ class CustomJSON(Task):
                     line = line.strip()
                     if not line:  # skip empty lines
                         continue
-                    messages = json.loads(line)
+                    try:
+                        messages = json.loads(line)
+                    except json.JSONDecodeError:
+                        print("-" * 80)
+                        print(f"Error: Failed to parse JSON in {filepath}")
+                        if line.startswith("<?xml"):
+                            print("HINT: The file appears to be an XML error message (possibly from S3).")
+                            print("This usually means the download failed or the link is broken.")
+                        print("Please delete the file and try to download it again, or check the source.")
+                        print("-" * 80)
+                        self.conversations = []
+                        break # Stop processing this file
                     # Validate the conversation structure
                     assert isinstance(messages, list), f"Expected list of messages, got {type(messages)}"
                     assert len(messages) >= 2, f"Conversation must have at least 2 messages, got {len(messages)}"
