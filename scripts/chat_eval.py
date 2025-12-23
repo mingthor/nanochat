@@ -8,6 +8,7 @@ python -m scripts.chat_eval -a ARC-Easy
 torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
+import time
 import argparse
 from functools import partial
 from contextlib import nullcontext
@@ -38,10 +39,12 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
     # Run the evaluation
     num_passed, total = 0, 0
     for i in range(ddp_rank, num_problems, ddp_world_size):
+        t_start = time.time()
         conversation = task_object[i]
 
         # Tokenize the prompt
         encoded_prompt = tokenizer.render_for_completion(conversation)
+        n_prompt = len(encoded_prompt)
         # Get the completions
         results, _ = engine.generate_batch(
             encoded_prompt,
@@ -53,6 +56,7 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         # Decode the completions as text
         prefix_length = len(encoded_prompt)
         completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
+        n_gen = sum(len(r) - prefix_length for r in results)
         # Evaluate success criteria
         outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
         passed = any(outcomes)
@@ -61,8 +65,9 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         total += 1
         num_passed += int(passed)
 
-        # Logging (overwrite the same line in the console)
-        print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
+        t_total = time.time() - t_start
+        print(f"Rank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%) | "
+              f"tokens {n_prompt}p + {n_gen}g | total {t_total:.2f}s")
 
     # Finish the in-place progress line with a newline before final summary
     print()
