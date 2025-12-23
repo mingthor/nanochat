@@ -17,6 +17,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 """
 
 import os
+import time
 import itertools
 import re
 import wandb
@@ -239,6 +240,7 @@ for step in range(num_steps):
         })
 
     # Forward/Backward on rollouts over multiple examples in the dataset
+    t0 = time.time()
     rewards_list = []
     sequence_lengths = []
     for example_step in range(examples_per_rank):
@@ -283,11 +285,13 @@ for step in range(num_steps):
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
+    dt = time.time() - t0
+    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f} | dt: {dt*1000:.2f}ms")
     wandb_run.log({
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
+        "dt": dt,
     })
 
     # Update the model parameters

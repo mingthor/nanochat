@@ -10,6 +10,8 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
 """
 
 import os
+import time
+import random
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import wandb
@@ -67,6 +69,7 @@ ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type
 master_process = ddp_rank == 0
 ptdtype = torch.float32 if dtype == 'float32' else torch.bfloat16
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
@@ -92,40 +95,68 @@ train_ds = TaskMixture([
 ]) # 2.3K + 1.1K + 8K + 10K + 1K + 0.3K + 0.3K = 23K rows
 val_ds = SmolTalk(split="test") # general conversations, 24K rows (though we don't actually use all of it)
 
+# Pre-tokenize the datasets for speed
+print0(f"Pre-tokenizing training dataset ({len(train_ds)} examples)...")
+train_data = []
+for i in range(len(train_ds)):
+    ids, mask = tokenizer.render_conversation(train_ds[i])
+    train_data.append((torch.tensor(ids, dtype=torch.long), torch.tensor(mask, dtype=torch.long)))
+# Sort by length to stabilize shapes and minimize padding
+train_data.sort(key=lambda x: x[0].size(0))
+
+print0(f"Pre-tokenizing validation dataset ({len(val_ds)} examples)...")
+val_data = []
+for i in range(len(val_ds)):
+    ids, mask = tokenizer.render_conversation(val_ds[i])
+    val_data.append((torch.tensor(ids, dtype=torch.long), torch.tensor(mask, dtype=torch.long)))
+
 # -----------------------------------------------------------------------------
 # DataLoader
 
-def sft_data_generator(dataset, batch_size):
+def sft_data_generator(data, batch_size):
     pad_token_id = tokenizer.encode_special("<|assistant_end|>") # use <|assistant_end|> as the pad token is ok, these positions are masked in the loss
     # prepares a list of tokenized conversations into a batch and yields
     def collate_and_yield(batch):
         nrows = len(batch)
-        ncols = max(len(ids) for ids, mask in batch) - 1 # seq of n creates inputs/targets of n-1
+        # seq of n creates inputs/targets of n-1
+        max_n = max(ids.size(0) for ids, mask in batch) - 1
+        # Round up to nearest multiple of 64 to help torch.compile stabilize shapes
+        ncols = ((max_n + 63) // 64) * 64
+        
         inputs = torch.full((nrows, ncols), pad_token_id, dtype=torch.long)
         targets = torch.full((nrows, ncols), -1, dtype=torch.long) # -1 is ignore index
         for i, (ids, mask) in enumerate(batch):
-            n = len(ids)
-            ids_tensor = torch.tensor(ids, dtype=torch.long)
-            inputs[i, :n-1] = ids_tensor[:-1]
+            n = ids.size(0) - 1
+            inputs[i, :n] = ids[:-1]
             # recall -1 is the ignore index, so mask out targets where mask is 0
-            row_targets = ids_tensor[1:]
+            row_targets = ids[1:].clone()
             # mask[1:] omits the mask for the BOS token, which is never a target atm so it's ok
-            mask_tensor = torch.tensor(mask[1:], dtype=torch.long)
-            row_targets[mask_tensor == 0] = -1 # mask out targets where mask is 0
-            targets[i, :n-1] = row_targets
-        inputs = inputs.to(device) # move to device
-        targets = targets.to(device)
+            row_targets[mask[1:] == 0] = -1 # mask out targets where mask is 0
+            targets[i, :n] = row_targets
+        
+        # Move to device with non_blocking=True and pinned memory
+        inputs = inputs.pin_memory().to(device, non_blocking=True)
+        targets = targets.pin_memory().to(device, non_blocking=True)
         return inputs, targets
-    # iterates over the dataset in epochs, tokenizes
+    # iterates over the dataset in epochs
     batch = []
+    epoch = 0
     while True:
-        for i in range(ddp_rank, len(dataset), ddp_world_size):
-            doc = dataset[i]
-            ids, mask = tokenizer.render_conversation(doc)
-            batch.append((ids, mask))
+        # Create indices and shuffle them in "buckets" to maintain some randomness 
+        # while keeping similar lengths together to stabilize torch.compile shapes
+        indices = list(range(len(data)))
+        bucket_size = batch_size * 100
+        for i in range(0, len(indices), bucket_size):
+            bucket = indices[i:i+bucket_size]
+            random.Random(42 + epoch + i).shuffle(bucket)
+            indices[i:i+bucket_size] = bucket
+            
+        for i in range(ddp_rank, len(indices), ddp_world_size):
+            batch.append(data[indices[i]])
             if len(batch) == batch_size:
                 yield collate_and_yield(batch)
                 batch = []
+        epoch += 1
 
 examples_per_step = device_batch_size * ddp_world_size
 print0(f"Target examples per step: {target_examples_per_step}")
@@ -139,8 +170,8 @@ if num_iterations == -1:
     # derive num_iterations from num_epochs and the size of the dataset
     assert num_epochs > 0, "num_epochs must be positive if num_iterations is -1"
     num_iterations = (len(train_ds) // target_examples_per_step) * num_epochs
-train_loader = sft_data_generator(train_ds, batch_size=device_batch_size)
-build_val_loader = lambda: sft_data_generator(val_ds, batch_size=device_batch_size)
+train_loader = sft_data_generator(train_data, batch_size=device_batch_size)
+build_val_loader = lambda: sft_data_generator(val_data, batch_size=device_batch_size)
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer
@@ -167,6 +198,7 @@ def get_lr_multiplier(it):
 
 # Go!
 step = 0
+train_inputs, train_targets = next(train_loader) # prefetch the first batch
 for step in range(num_iterations):
     last_step = step == num_iterations - 1
 
@@ -211,15 +243,23 @@ for step in range(num_iterations):
         break
 
     # evaluate the gradient
+    synchronize()
+    t0 = time.time()
     num_tokens = torch.tensor(0, device=device) # the number of "active" tokens of supervision seen
     for micro_step in range(grad_accum_steps):
-        train_inputs, train_targets = next(train_loader)
+        # use the prefetched batch
+        inputs, targets = train_inputs, train_targets
+        
         with autocast_ctx:
-            loss = model(train_inputs, train_targets)
+            loss = model(inputs, targets)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward() # accumulate the gradient
-        num_tokens += (train_targets >= 0).sum()
+        num_tokens += (targets >= 0).sum()
+
+        # prefetch the next batch while the GPU is busy with the current backward pass
+        train_inputs, train_targets = next(train_loader)
+
     if ddp:
         dist.all_reduce(num_tokens, op=dist.ReduceOp.SUM) # sum over ranks
 
@@ -233,16 +273,19 @@ for step in range(num_iterations):
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    synchronize()
+    dt = time.time() - t0
 
     # logging
     train_loss_item = train_loss.item()
     num_tokens_item = num_tokens.item()
-    print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f}| lrm: {lrm:.6f}| num_tokens: {num_tokens_item:,}")
+    print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f}| lrm: {lrm:.6f}| dt: {dt*1000:.2f}ms | num_tokens: {num_tokens_item:,}")
     wandb_run.log({
         "step": step,
         "lrm": lrm,
         "train_loss": train_loss_item,
         "num_tokens": num_tokens_item,
+        "dt": dt,
     })
     step += 1
 
