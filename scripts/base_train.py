@@ -243,7 +243,7 @@ while True:
     if core_metric_every > 0 and (last_step or (step > 0 and step % core_metric_every == 0)):
         model.eval()
         with autocast_ctx:
-            results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
+            results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task, max_tokens=device_batch_size*max_seq_len)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
