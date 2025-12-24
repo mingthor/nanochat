@@ -85,7 +85,25 @@ class CausalSelfAttention(nn.Module):
 
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
         enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
+        if kv_cache is not None:
+            # Static KV cache logic with masking
+            # kv_cache.get_pos() returns the start position of the current insertion
+            # We want to attend to [0, pos + Tq)
+            # Mask out [pos + Tq, Tk)
+            # Also apply causal mask for the new tokens [pos, pos + Tq)
+            
+            # Construct mask (Tq, Tk)
+            # Row i (0..Tq-1) attends to keys 0..(pos + i)
+            
+            indices = torch.arange(Tk, device=q.device).unsqueeze(0)
+            limit = (kv_cache.get_pos() + torch.arange(Tq, device=q.device)).unsqueeze(1)
+            mask = indices <= limit
+            
+            # Broadcast mask to (1, 1, Tq, Tk)
+            mask = mask.unsqueeze(0).unsqueeze(0)
+            
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+        elif Tq == Tk:
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
@@ -261,6 +279,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
+
+        if kv_cache is not None:
+            kv_cache.update(T)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
