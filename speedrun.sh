@@ -105,7 +105,7 @@ python -m nanochat.dataset -n 240 &
 DATASET_DOWNLOAD_PID=$!
 
 # Pre-download HuggingFace datasets for midtraining and evaluation
-python dev/download_hf_datasets.py
+python -m dev.download_hf_datasets
 
 # train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
 python -m scripts.tok_train --max_chars=2000000000
@@ -163,9 +163,9 @@ python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m
 # (optional)
 
 # run reinforcement learning
-# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_rl -- --run=$WANDB_RUN
+# python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_rl -- --run=$WANDB_RUN
 # eval the RL model only on GSM8K
-# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rl -a GSM8K
+# python -m torch.distributed.run --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rl -a GSM8K
 
 # -----------------------------------------------------------------------------
 # Generate the full report by putting together all the sections

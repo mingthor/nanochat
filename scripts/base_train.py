@@ -213,6 +213,8 @@ else:
 
 # -----------------------------------------------------------------------------
 # Training loop
+prof = None
+trace_path = None
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -304,19 +306,18 @@ while True:
     # single training step
 
     # start the profiler (only on master process to avoid race conditions)
-    do_profile = (step == profile_step and master_process)
-    if do_profile:
+    if master_process and step == profile_step:
         profiler_dir = os.path.join(base_dir, "profiler")
         if not os.path.exists(profiler_dir):
             os.makedirs(profiler_dir, exist_ok=True)
-        print0(f"Starting profiler for step {step}...")
-        trace_path = os.path.join(profiler_dir, f"trace_step_{step}.json")
+        print0(f"Starting profiler at step {step} (wait=1, warmup=4, active=1)...")
+        trace_path = os.path.join(profiler_dir, f"trace_step_{step}.json.gz")
         prof = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            schedule=None,
+            schedule=torch.profiler.schedule(wait=1, warmup=4, active=1, repeat=1),
             on_trace_ready=lambda p: p.export_chrome_trace(trace_path),
             record_shapes=True,
-            profile_memory=False,
+            profile_memory=True,
             with_stack=True
         )
         prof.start()
@@ -359,9 +360,12 @@ while True:
     dt = t1 - t0
 
     # stop the profiler
-    if do_profile:
-        prof.stop()
-        print0(f"Profiler stopped. Trace saved to {trace_path}")
+    if prof:
+        prof.step()
+        if step == profile_step + 5:
+            prof.stop()
+            print0(f"Profiler stopped. Trace saved to {trace_path}")
+            prof = None
 
     # -------------------------------------------------------------------------
 
