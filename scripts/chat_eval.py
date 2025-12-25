@@ -29,8 +29,7 @@ from tasks.spellingbee import SpellingBee
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
-def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
-
+def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, batch_size=8, max_problems=None):
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
 
@@ -38,36 +37,63 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
     # Run the evaluation
     num_passed, total = 0, 0
-    for i in range(ddp_rank, num_problems, ddp_world_size):
-        t_start = time.time()
+    
+    # Pre-tokenize all prompts to group by length
+    all_prompts = []
+    for i in range(num_problems):
         conversation = task_object[i]
-
-        # Tokenize the prompt
         encoded_prompt = tokenizer.render_for_completion(conversation)
-        n_prompt = len(encoded_prompt)
-        # Get the completions
+        all_prompts.append({'index': i, 'prompt': encoded_prompt, 'conversation': conversation})
+        
+    # Group by length
+    from collections import defaultdict
+    by_length = defaultdict(list)
+    for item in all_prompts:
+        by_length[len(item['prompt'])].append(item)
+        
+    # Create batches of same-length prompts
+    all_batches = []
+    sorted_lengths = sorted(by_length.keys())
+    for length in sorted_lengths:
+        items = by_length[length]
+        for i in range(0, len(items), batch_size):
+            all_batches.append(items[i : i + batch_size])
+            
+    # Distribute batches across ranks
+    my_batches = all_batches[ddp_rank::ddp_world_size]
+    for chunk_items in my_batches:
+        t_start = time.time()
+        
+        conversations = [item['conversation'] for item in chunk_items]
+        encoded_prompts = [item['prompt'] for item in chunk_items]
+        n_prompt = sum(len(p) for p in encoded_prompts)
+        
         results, _ = engine.generate_batch(
-            encoded_prompt,
+            encoded_prompts,
             num_samples=num_samples,
             max_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
         )
-        # Decode the completions as text
-        prefix_length = len(encoded_prompt)
-        completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
-        n_gen = sum(len(r) - prefix_length for r in results)
-        # Evaluate success criteria
-        outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
-        passed = any(outcomes)
+        
+        # Decode and evaluate
+        n_gen = 0
+        batch_passed = 0
+        for i, result_tokens in enumerate(results):
+            prefix_length = len(encoded_prompts[i])
+            completion = tokenizer.decode(result_tokens[prefix_length:])
+            n_gen += len(result_tokens) - prefix_length
+            
+            if task_object.evaluate(conversations[i], completion):
+                batch_passed += 1
 
         # Keep stats
-        total += 1
-        num_passed += int(passed)
+        total += len(chunk_items)
+        num_passed += batch_passed
 
         t_total = time.time() - t_start
         print(f"Rank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%) | "
-              f"tokens {n_prompt}p + {n_gen}g | total {t_total:.2f}s")
+              f"tokens {n_prompt}p + {n_gen}g | time {t_total:.2f}s | batch_size {len(chunk_items)}")
 
     # Finish the in-place progress line with a newline before final summary
     print()
@@ -176,7 +202,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     task_object = task_module()
     # Run the evaluation
     if task_object.eval_type == 'generative':
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
+        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, batch_size=batch_size, max_problems=max_problems)
     elif task_object.eval_type == 'categorical':
         acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
     else:
@@ -222,6 +248,9 @@ if __name__ == "__main__":
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 
+    if args.num_samples != 1:
+        raise NotImplementedError("num_samples > 1 is not yet supported in batched evaluation.")
+    
     # Run all the task evaluations sequentially
     results = {}
     for task_name in task_names:
