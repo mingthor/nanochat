@@ -13,7 +13,7 @@ from jinja2 import Template
 import torch
 import torch.distributed as dist
 
-from nanochat.configurator import print0
+from nanochat.common import print0
 
 # -----------------------------------------------------------------------------
 # Prompt rendering utilities

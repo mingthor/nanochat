@@ -19,45 +19,20 @@ mkdir -p $NANOCHAT_BASE_DIR
 # -----------------------------------------------------------------------------
 # Python environment setup
 
-if [ -n "$CONDA_ENV" ]; then
-    # Using existing conda environment
-    echo "Using Conda environment: $CONDA_ENV"
+# Using uv (default)
+echo "Using uv for environment management"
 
-    # Initialize conda if needed
-    eval "$(conda shell.bash hook)" 2>/dev/null || true
+# install uv (if not already installed)
+command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+# create a .venv local virtual environment (if it doesn't exist)
+[ -d ".venv" ] || uv venv
 
-    # activate conda environment
-    conda activate "$CONDA_ENV"
+# Sync dependencies (creates .venv if needed)
+uv sync --extra gpu
 
-    # Unset VIRTUAL_ENV to avoid conflicts with conda
-    unset VIRTUAL_ENV
-
-    # install only the non-pytorch dependencies
-    python -m pip install datasets fastapi files-to-prompt psutil regex setuptools tiktoken tokenizers uvicorn wandb maturin
-    
-    # Ensure the bin directory of the current python is in PATH so we can find maturin and files-to-prompt
-    PYTHON_BIN_DIR="$(python -c 'import sys, os; print(os.path.join(sys.prefix, "bin"))')"
-    # Also add user base bin directory (common for --user installs or some distros)
-    USER_BIN_DIR="$(python -c 'import site, os; print(os.path.join(site.getuserbase(), "bin"))')"
-    export PATH="$PYTHON_BIN_DIR:$USER_BIN_DIR:$PATH"
-
-    MATURIN_CMD="maturin"
-else
-    # Using uv (default)
-    echo "Using uv for environment management"
-
-    # install uv (if not already installed)
-    command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-    # create a .venv local virtual environment (if it doesn't exist)
-    [ -d ".venv" ] || uv venv
-
-    # Sync dependencies (creates .venv if needed)
-    uv sync --extra gpu
-
-    # Activate the environment
-    source .venv/bin/activate
-    MATURIN_CMD="uv run maturin"
-fi
+# Activate the environment
+source .venv/bin/activate
+MATURIN_CMD="uv run maturin"
 
 # -----------------------------------------------------------------------------
 # wandb setup
